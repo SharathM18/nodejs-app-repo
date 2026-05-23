@@ -1,0 +1,116 @@
+name: Reusable - Testing
+
+on:
+  workflow_call:
+    inputs:
+      # Minimum coverage % required. Pipeline fails if below this.
+      # Industry standard is 80%. Adjust for your project.
+      coverage-threshold:
+        type: number
+        default: 80
+        required: false
+    secrets:
+      # SonarQube server URL (e.g., https://sonar.yourcompany.com)
+      SONAR_HOST_URL:
+        required: true
+      # SonarQube authentication token (generated in SonarQube UI)
+      SONAR_TOKEN:
+        required: true
+
+# Minimal permissions only what this job needs.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit Tests and Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # If tests run > 5 minutes, uncomment and configure matrix:
+    # strategy:
+    #   fail-fast: true   # Stop all matrix jobs if one fails
+    #   matrix:
+    #     test-group: [unit, integration]
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      # Restore cached dependencies from environment-setup job
+      - name: Restore Dependency Cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: node_modules
+          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
+
+      # --------------------------------------------------------
+      # STEP 3: Run tests
+      # --coverage: generate coverage report
+      # --reporters=jest-junit: generate JUnit XML for test results
+      # Jest configuration in package.json should set:
+      #   coverageReporters: ["lcov", "text", "html"]
+      #   coverageThreshold: { global: { lines: 80 } }
+      # --------------------------------------------------------
+      - name: Run Tests with Coverage
+        run: |
+          npm test -- \
+            --coverage \
+            --coverageDirectory=./coverage \
+            --reporters=default \
+            --reporters=jest-junit \
+            --forceExit
+        env:
+          # Tells Jest to output JUnit XML format
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+          JEST_JUNIT_OUTPUT_NAME: test-result.xml
+          # CI=true prevents interactive prompts in Jest
+          CI: true
+
+      - name: Upload Test Results as Artifact
+        if: always() # Upload even if tests fail — need to see results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results
+          path: test-results/test-result.xml
+          retention-days: 90
+
+      - name: Upload Coverage Report as Artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: |
+            coverage/lcov.info
+            coverage/lcov-report/
+          retention-days: 90
+
+      # --------------------------------------------------------
+      # Upload coverage to SonarQube
+      # SonarQube needs the LCOV file to show coverage
+      # data in its dashboard and enforce coverage quality gate.
+      # The sonar-project.properties file in your repo root
+      # must point to: sonar.javascript.lcov.reportPaths=coverage/lcov.info
+      # --------------------------------------------------------
+      - name: Upload Coverage to SonarQube
+        uses: SonarSource/sonarqube-scan-action@2500896589ef8f7247069a56136f8dc177c27ccf # v5.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # This is an extra explicit check with a clear error message.
+      - name: Check Coverage Threshold
+        run: |
+          COVERAGE=$(node -e "
+            const fs = require('fs');
+            const summary = JSON.parse(fs.readFileSync('./coverage/coverage-summary.json'));
+            console.log(summary.total.lines.pct);
+          ")
+          echo "Coverage: ${COVERAGE}%"
+          echo "Required: ${{ inputs.coverage-threshold }}%"
+          if (( $(echo "$COVERAGE < ${{ inputs.coverage-threshold }}" | bc -l) )); then
+            echo "❌ Coverage ${COVERAGE}% is below required ${{ inputs.coverage-threshold }}%"
+            exit 1
+          fi
+          echo "✅ Coverage check passed"

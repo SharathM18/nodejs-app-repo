@@ -1,0 +1,186 @@
+name: Reusable - Static Analysis
+
+on:
+  workflow_call:
+    secrets:
+      # SonarQube server URL (e.g., https://sonar.yourcompany.com)
+      SONAR_HOST_URL:
+        required: true
+      # SonarQube authentication token (generated in SonarQube UI)
+      SONAR_TOKEN:
+        required: true
+
+# Minimal permissions only what this job needs.
+permissions:
+  contents: read
+  security-events: write # Upload SARIF to GitHub Security tab
+
+jobs:
+  trivy-fs-scan:
+    name: SCA - Trivy Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      # Restore cached dependencies from environment-setup job
+      - name: Restore Dependency Cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: node_modules
+          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
+
+      - name: Trivy FS Scan - Generate SARIF Report
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0" # Upload first, fail later
+
+      - name: Upload Trivy FS SARIF to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@45775bd8235c68ba998cffa5171334d58593da47 # v3.28.15
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-filesystem-scan
+
+      - name: Trivy FS Scan - Generate JSON Report and Fail on Issues
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs.json
+          severity: HIGH,CRITICAL
+          exit-code: "1" # Now fail if critical found
+
+      # Save JSON report regardless of pass/fail for audit trail
+      - name: Upload Trivy FS JSON Report as Artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-fs-report
+          path: trivy-fs.json
+          retention-days: 90
+
+  sonarqube-scan:
+    name: SAST - SonarQube Code Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # Full history needed for SonarQube
+      # Restore cached dependencies from environment-setup job
+      - name: Restore Dependency Cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: node_modules
+          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
+
+      # --------------------------------------------------------
+      # Run SonarQube analysis.
+      # SonarQube reads sonar-project.properties in your repo root
+      # for configuration (project key, exclusions, etc.)
+      # Coverage data from the testing job should be uploaded
+      # before this runs in the main pipeline (testing → sonar).
+      # --------------------------------------------------------
+      - name: Run SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@2500896589ef8f7247069a56136f8dc177c27ccf # v5.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # --------------------------------------------------------
+      # Quality Gate check.
+      # SonarQube has a "Quality Gate" — a configurable threshold.
+      # Default gate: 0 new bugs, 0 new vulnerabilities,
+      #               80% coverage on new code.
+      # If gate fails → pipeline fails.
+      # You configure the gate in the SonarQube UI.
+      # --------------------------------------------------------
+      - name: Check SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@72207e08a2e8b0b57f26424584a6f05c0c55a5a8 # v1.1.0
+        timeout-minutes: 5 # Don't wait forever for SonarQube response
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  code-lint:
+    name: Code Linting - ESLint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+      # Restore cached dependencies from environment-setup job
+      - name: Restore Dependency Cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: node_modules
+          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
+
+      # --------------------------------------------------------
+      # The @microsoft/eslint-formatter-sarif package must be
+      # in your devDependencies for SARIF output to work.
+      # --------------------------------------------------------
+      - name: Run ESLint - Generate SARIF Report
+        run: |
+          npx eslint . \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file lint.sarif \
+            --ext .js,.ts,.jsx,.tsx || true
+        # || true = don't fail here, continue to upload
+
+      - name: Upload ESLint SARIF to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@45775bd8235c68ba998cffa5171334d58593da47 # v3.28.15
+        with:
+          sarif_file: lint.sarif
+          category: eslint
+
+      - name: Run ESLint - Fail on Errors
+        run: npx eslint . --ext .js,.ts,.jsx,.tsx --max-warnings 0
+        # --max-warnings 0 = treat all warnings as errors
+
+  dockerfile-lint:
+    name: Dockerfile Linting - Hadolint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Run Hadolint - Generate SARIF Report
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: hadolint.sarif
+          no-fail: true # Don't fail here — upload first
+
+      - name: Upload Hadolint SARIF to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@45775bd8235c68ba998cffa5171334d58593da47 # v3.28.15
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint-dockerfile
+
+      - name: Run Hadolint - Fail on Issues
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning # Fail on warnings and above

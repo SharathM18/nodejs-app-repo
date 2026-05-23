@@ -1,0 +1,243 @@
+name: Reusable - Container Build, Scan, Push
+
+on:
+  workflow_call:
+    inputs:
+      # PR:   pr-123-abc4567
+      # Prod: v1.3.0
+      image-tag:
+        type: string
+        required: true
+
+      # Whether to push the image to registry.
+      # Always true in both PR and Prod for our setup.
+      push:
+        type: boolean
+        default: true
+        required: false
+
+      # Whether to sign the image after pushing.
+      # PR mode: false (DEV images don't need signing)
+      # Prod mode: true (PROD images must be signed)
+      sign:
+        type: boolean
+        default: false
+        required: false
+
+      # Target environment — used for tagging/labeling context.
+      environment:
+        type: string
+        default: dev
+        required: false
+
+    secrets:
+      # AWS IAM Role ARN that GitHub Actions will assume via OIDC.
+      # Format: arn:aws:iam::123456789:role/github-actions-role
+      AWS_ROLE_ARN:
+        required: true
+      AWS_REGION:
+        required: true
+      # Your ECR registry URL.
+      # Format: 123456789.dkr.ecr.us-east-1.amazonaws.com
+      ECR_REGISTRY:
+        required: true
+      # Your ECR repository name. Example: myapp
+      ECR_REPOSITORY:
+        required: true
+
+# id-token: write is REQUIRED for OIDC authentication with AWS.
+# Without this, GitHub cannot generate the OIDC token.
+permissions:
+  id-token: write # Generate OIDC token for AWS auth + Cosign signing
+  contents: read
+  security-events: write # Upload SARIF to GitHub Security tab
+
+jobs:
+  container-build-scan-push:
+    name: Docker Build, Scan, Push${{ inputs.sign && ', Sign' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      # --------------------------------------------------------
+      # STEP 2: AWS Authentication via OIDC
+      # This replaces storing AWS_ACCESS_KEY_ID in secrets.
+      # GitHub sends its OIDC token to AWS.
+      # AWS verifies the token and returns temporary credentials.
+      # Credentials are valid only for this job run.
+      #
+      # One-time AWS setup required:
+      # 1. Create IAM OIDC Identity Provider for GitHub
+      # 2. Create IAM Role with trust policy allowing GitHub
+      # 3. Attach ECR push permissions to that role
+      # --------------------------------------------------------
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e067cf81034c3fd # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # Token will be valid for 1 hour — more than enough for this job
+
+      # --------------------------------------------------------
+      # STEP 3: Login to Amazon ECR
+      # Uses the temporary credentials from OIDC auth above.
+      # Outputs the registry URL for use in later steps.
+      # --------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      # --------------------------------------------------------
+      # STEP 4: Set full image reference
+      # Combines registry URL + repository name + tag.
+      # Example: 123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:v1.3.0
+      # --------------------------------------------------------
+      - name: Set Image Reference
+        id: image-ref
+        run: |
+          IMAGE="${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:${{ inputs.image-tag }}"
+          echo "full-image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "Building image: ${IMAGE}"
+
+      # --------------------------------------------------------
+      # STEP 5: Build Docker Image
+      # Labels embed metadata INSIDE the image.
+      # Months later, inspect any running container:
+      #   docker inspect <container> | grep Labels
+      # You'll see exactly which commit and pipeline built it.
+      # --------------------------------------------------------
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --tag ${{ steps.image-ref.outputs.full-image }} \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.version=${{ inputs.image-tag }}" \
+            --label "pipeline.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label "pipeline.environment=${{ inputs.environment }}" \
+            .
+
+      # --------------------------------------------------------
+      # STEP 6A: Trivy Image Scan - SARIF for Security Tab
+      # Scans the built image: base OS + runtime + your app.
+      # This catches CVEs in the base image (e.g., ubuntu:22.04)
+      # that source code scan (Trivy FS) cannot catch.
+      # exit-code: '0' = don't fail, just generate report
+      # --------------------------------------------------------
+      - name: Trivy Image Scan - Generate SARIF Report
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image-ref.outputs.full-image }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Upload Trivy Image SARIF to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@45775bd8235c68ba998cffa5171334d58593da47 # v3.28.15
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-scan
+
+      # --------------------------------------------------------
+      # STEP 6B: Trivy Image Scan - JSON + FAIL on issues
+      # exit-code: '1' = fail pipeline if HIGH/CRITICAL found
+      # --------------------------------------------------------
+      - name: Trivy Image Scan - Generate JSON Report and Fail on Issues
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image-ref.outputs.full-image }}
+          format: json
+          output: trivy-image.json
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Upload Trivy Image JSON Report as Artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-image-report
+          path: trivy-image.json
+          retention-days: 90
+
+      # --------------------------------------------------------
+      # STEP 7: Generate SBOM - SPDX format
+      # SBOM = complete list of every component in the image.
+      # SPDX = US government / OpenChain standard format.
+      # Used for compliance and future CVE lookups.
+      # --------------------------------------------------------
+      - name: Generate SBOM - SPDX Format
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
+        with:
+          image: ${{ steps.image-ref.outputs.full-image }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-spdx
+
+      # --------------------------------------------------------
+      # STEP 8: Generate SBOM - CycloneDX format
+      # CycloneDX = OWASP standard format.
+      # Different tools prefer different formats.
+      # Best practice: generate both and store both.
+      # --------------------------------------------------------
+      - name: Generate SBOM - CycloneDX Format
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
+        with:
+          image: ${{ steps.image-ref.outputs.full-image }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          artifact-name: sbom-cyclonedx
+
+      # --------------------------------------------------------
+      # STEP 9: Push Docker Image to ECR
+      # Only runs if push=true (always true in our setup).
+      # Image is now in ECR and accessible to DEV/PROD envs.
+      # --------------------------------------------------------
+      - name: Push Docker Image to ECR
+        if: inputs.push == true
+        run: docker push ${{ steps.image-ref.outputs.full-image }}
+
+      # --------------------------------------------------------
+      # STEP 10: Sign Docker Image (PRODUCTION ONLY)
+      # Only runs when sign=true (prod pipeline only).
+      # Cosign uses keyless signing — no private key stored.
+      # GitHub Actions OIDC token proves the identity.
+      # Signature stored in public Rekor log.
+      #
+      # After signing, anyone can verify:
+      #   cosign verify \
+      #     --certificate-identity-regexp "https://github.com/yourorg/yourrepo/*" \
+      #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+      #     <image>
+      #
+      # Kubernetes can enforce: only signed images run in prod.
+      # --------------------------------------------------------
+      - name: Install Cosign for Image Signing
+        if: inputs.sign == true
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Sign Docker Image with Cosign (Keyless)
+        if: inputs.sign == true
+        run: |
+          cosign sign --yes ${{ steps.image-ref.outputs.full-image }}
+        env:
+          COSIGN_EXPERIMENTAL: "1" # Enable keyless signing mode
+
+      # --------------------------------------------------------
+      # STEP 11: Output the image reference for use in caller
+      # The prod pipeline needs this to update infra-live repo.
+      # --------------------------------------------------------
+      - name: Print Final Image Reference
+        run: |
+          echo "✅ Image ready: ${{ steps.image-ref.outputs.full-image }}"
+          if [ "${{ inputs.sign }}" == "true" ]; then
+            echo "✅ Image signed with Cosign (keyless)"
+          fi

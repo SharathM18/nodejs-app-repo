@@ -1,0 +1,180 @@
+name: Merge - Production Release
+
+on:
+  push:
+    branches: ["main"]
+
+# NEVER cancel previous run for same PR when new commit is pushed.
+concurrency:
+  group: prod-release
+  cancel-in-progress: false # Never cancel prod release mid-run
+
+# Declare all permissions needed across all jobs.
+permissions:
+  contents: write # Create git tags and GitHub Releases
+  pull-requests: write # (Optional) for release PR if using release-please
+  security-events: write # Upload SARIF to Security tab
+  id-token: write # OIDC for AWS auth + Cosign image signing
+
+jobs:
+  secret-scan:
+    name: Secret Scan
+    uses: ./.github/workflows/reusable-secret-scan.yml
+    secrets: inherit
+
+  environment-setup:
+    name: Environment Setup
+    uses: ./.github/workflows/reusable-environment-setup.yml
+    with:
+      node-version: "20"
+    secrets: inherit
+
+  calculate-version:
+    name: Calculate Next Release Version
+    needs: [secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Output the calculated version so container-build job can use it
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      has-release: ${{ steps.get-version.outputs.has-release }}
+
+    steps:
+      # Full history needed — semantic-release reads all commits
+      # since the last git tag to calculate the next version
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          # Use a PAT so semantic-release can push tags back to the repo.
+          # GITHUB_TOKEN can't push to protected branches.
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Setup Node.js for semantic-release
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
+        with:
+          node-version: "20"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/git \
+            @semantic-release/github
+
+      # --------------------------------------------------------
+      # DRY RUN: Calculate version without creating tags.
+      # --dry-run: analyse commits, output next version, stop.
+      # We grep the output for the version number and store it.
+      #
+      # If no releasable commits (e.g., only 'chore:' commits),
+      # semantic-release outputs "no release" and we skip.
+      # --------------------------------------------------------
+      - name: Calculate Next Version (Dry Run)
+        id: get-version
+        run: |
+          # Run semantic-release in dry-run mode, capture output
+          DRY_RUN_OUTPUT=$(npx semantic-release --dry-run 2>&1)
+          echo "--- Dry Run Output ---"
+          echo "$DRY_RUN_OUTPUT"
+          echo "----------------------"
+
+          # Extract the version number from the output
+          VERSION=$(echo "$DRY_RUN_OUTPUT" | \
+            grep -oP "(?<=The next release version is )\d+\.\d+\.\d+" | \
+            head -1)
+
+          if [ -z "$VERSION" ]; then
+            echo "No releasable commits found (only chore/docs/ci commits)."
+            echo "version=none" >> $GITHUB_OUTPUT
+            echo "has-release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Next version will be: v${VERSION}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "has-release=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
+  testing:
+    name: Testing and Coverage
+    needs: [environment-setup]
+    uses: ./.github/workflows/reusable-testing.yml
+    with:
+      coverage-threshold: 80
+    secrets: inherit
+
+  static-analysis:
+    name: Static Analysis
+    # If your tests finish in under 5 minutes, then remove the testing from needs for static-analysis.
+    # If testing take longer than 5 minutes, make static-analysis depend on testing.
+    needs: [secret-scan, environment-setup]
+    uses: ./.github/workflows/reusable-static-analysis.yml
+    secrets: inherit
+
+  container-build-and-scan:
+    name: Container Build, Scan, Push, Sign
+    needs: [static-analysis, testing, calculate-version]
+    # Skip this job if there's no new version to release
+    if: needs.calculate-version.outputs.has-release == 'true'
+    uses: ./.github/workflows/reusable-docker.yml
+    with:
+      # Production image tag: v1.3.0
+      image-tag: v${{ needs.calculate-version.outputs.version }}
+      push: true
+      sign: true # PROD images are ALWAYS signed
+      environment: prod
+    secrets: inherit
+
+  github-release:
+    name: Create GitHub Release
+    needs: [container-build-and-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+          # RELEASE_PAT: Personal Access Token with 'repo' scope.
+          # Needed to push git tags and create releases on protected branches.
+
+      - name: Setup Node.js for semantic-release
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
+        with:
+          node-version: "20"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/git \
+            @semantic-release/github
+
+      # --------------------------------------------------------
+      # REAL RUN: Create the actual release.
+      # semantic-release will:
+      # 1. Determine version (same as dry-run calculated)
+      # 2. Update CHANGELOG.md
+      # 3. Commit CHANGELOG.md to main
+      # 4. Create git tag: v1.3.0
+      # 5. Create GitHub Release with auto-generated notes
+      #    listing all feat: and fix: commits since last release
+      # --------------------------------------------------------
+      - name: Create Release with semantic-release
+        run: npx semantic-release
+        env:
+          # RELEASE_PAT needed to push to protected main branch
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
+      - name: Print Release Summary
+        run: |
+          echo "✅ GitHub Release created"
+          echo "✅ Git tag created: v${{ needs.calculate-version.outputs.version }}"
+          echo "✅ CHANGELOG.md updated"
+          echo "✅ Docker image: ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:v${{ needs.calculate-version.outputs.version }}"

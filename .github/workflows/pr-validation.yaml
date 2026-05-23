@@ -1,0 +1,131 @@
+name: PR - Validation Pipeline
+
+on:
+  pull_request:
+    branches: ['main']
+    types: [opened, synchronize, reopened]
+    # Path filtering (Only trigger for specific file changes)
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+
+# Cancel previous run for same PR when new commit is pushed.
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Declare all permissions needed across all jobs.
+permissions:
+  contents: read # Checkout code
+  pull-requests: write # Post PR comment
+  security-events: write # Upload SARIF to Security tab
+  id-token: write # OIDC auth for AWS + Cosign
+
+jobs:
+  secret-scan:
+    name: Secret Scan
+    uses: ./.github/workflows/reusable-secret-scan.yaml
+    secrets: inherit
+
+  # environment-setup:
+  #   name: Environment Setup
+  #   uses: ./.github/workflows/reusable-environment-setup.yaml
+  #   with:
+  #     node-version: "20"
+  #   secrets: inherit
+
+  # testing:
+  #   name: Testing and Coverage
+  #   needs: [environment-setup]
+  #   uses: ./.github/workflows/reusable-testing.yaml
+  #   with:
+  #     coverage-threshold: 80
+  #   secrets: inherit
+
+  # static-analysis:
+  #   name: Static Analysis
+  #   # If your tests finish in under 5 minutes, then remove the testing from needs for static-analysis.
+  #   # If testing take longer than 5 minutes, make static-analysis depend on testing.
+  #   needs: [secret-scan, environment-setup]
+  #   uses: ./.github/workflows/reusable-static-analysis.yaml
+  #   secrets: inherit
+
+  # container-build-and-scan:
+  #   name: Container Build, Scan, Push
+  #   needs: [static-analysis, testing]
+  #   uses: ./.github/workflows/reusable-docker.yaml
+  #   with:
+  #     image-tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+  #     push: true
+  #     sign: false # DEV images are NOT signed
+  #     environment: dev
+
+  # update-dev-manifest:
+  #   name: Update DEV Manifest in Infra-Live
+  #   needs: [container-build-and-scan]
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 10
+  #   if: github.event_name == 'pull_request'
+
+  #   steps:
+  #     - name: Clone infra-live Repository
+  #       run: |
+  #         git clone https://x-access-token:${{ secrets.INFRA_LIVE_PAT }}@github.com/${{ github.repository_owner }}/infra-live.git
+  #         cd infra-live
+  #         git config user.email "github-actions@github.com"
+  #         git config user.name "GitHub Actions"
+
+  #     - name: Update DEV Image Tag in Manifest
+  #       run: |
+  #         cd infra-live
+  #         NEW_TAG="pr-${{ github.event.pull_request.number }}-${{ github.sha }}"
+  #         BRANCH_NAME="update-dev-image-${NEW_TAG}"
+
+  #         # Create a new branch for this update
+  #         git checkout -b "${BRANCH_NAME}"
+
+  #         # Replace the image tag in the DEV deployment manifest
+  #         # Adjust the file path to match your infra-live structure
+  #         sed -i "s|image:.*/${{ secrets.ECR_REPOSITORY }}:.*|image: ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:${NEW_TAG}|g" \
+  #           environments/dev/deployment.yaml
+
+  #         # Commit the change
+  #         git add environments/dev/deployment.yaml
+  #         git commit -m "chore: update dev image to ${NEW_TAG}
+
+  #         Triggered by app repo PR #${{ github.event.pull_request.number }}
+  #         Commit: ${{ github.sha }}
+  #         Pipeline: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  #         # Push the branch to infra-live
+  #         git push origin "${BRANCH_NAME}"
+
+  #         # Open a Pull Request in infra-live using GitHub CLI
+  #         gh pr create \
+  #           --repo "${{ github.repository_owner }}/infra-live" \
+  #           --title "Update DEV image: ${NEW_TAG}" \
+  #           --body "## DEV Environment Update
+
+  #         **App Repo PR:** ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+  #         **New Image:** \`${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:${NEW_TAG}\`
+  #         **Commit:** \`${{ github.sha }}\`
+
+  #         Merge this PR to deploy the new image to DEV environment via ArgoCD." \
+  #           --base main \
+  #           --head "${BRANCH_NAME}"
+  #       env:
+  #         GH_TOKEN: ${{ secrets.INFRA_LIVE_PAT }}
+  #         ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  #         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+  # report-summary:
+  #   name: PR Report Summary
+  #   # Wait for ALL jobs to finish (pass or fail)
+  #   needs: [secret-scan, static-analysis, testing, container-build-and-scan]
+  #   uses: ./.github/workflows/reusable-report-summary.yaml
+  #   with:
+  #     image-tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+  #   secrets: inherit
+  #   # if: always() in the reusable workflow handles running even on failure
