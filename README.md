@@ -3,15 +3,8 @@
 ### How to Get SHA for Any GitHub Action
 
 ```bash
-git ls-remote <https://github.com/actions/checkout.git> refs/tags/<v6.0.2> | cut -f1
+./scripts/get-github-action-sha.sh <actions/upload-artifact>
 ```
-
-| Repository      | Links                                           |
-| --------------- | ----------------------------------------------- |
-| Checkout        | https://github.com/actions/checkout.git         |
-| gitleaks-action | https://github.com/gitleaks/gitleaks-action.git |
-| codeql-action   | https://github.com/github/codeql-action.git     |
-| upload-artifact | https://github.com/actions/upload-artifact.git  |
 
 ## [Reusable Static Analysis](.github/workflows/reusable-static-analysis.yaml)
 
