@@ -1,9 +1,9 @@
 name: PR - Validation Pipeline
 
 on:
-  pull_request:
+  push:
     branches: ['main']
-    types: [opened, synchronize, reopened]
+    # types: [opened, synchronize, reopened]
     # Path filtering (Only trigger for specific file changes)
     paths:
       - 'src/**'
