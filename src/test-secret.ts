@@ -1,4 +1,4 @@
 export const awsConfig = {
-  accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
-  secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  accessKeyId: 'AKIAIOSFODNN7NOTEXAMP',
+  secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYNOTEXAMPLE1',
 };
